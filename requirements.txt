@@ -1,0 +1,12 @@
+torch==2.3.0
+torchvision==0.18.0
+torchaudio==2.3.0
+numpy>=1.23,<2.0
+onnx>=1.15
+onnxruntime-silicon; platform_system == "Darwin" and platform_machine == "arm64"
+onnxruntime; platform_system != "Darwin" or platform_machine != "arm64"
+psutil>=5.9
+pyyaml>=6.0
+tqdm>=4.65
+scikit-learn>=1.3
+pytest>=7.4
