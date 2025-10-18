@@ -219,5 +219,4 @@ or `mobileone` as needed (install `timm` beforehand for the latter three).
 
 ## License
 
-A license has not yet been specified. Add an appropriate license file before
-publishing the project.
+This project is licensed under the Apache License 2.0. See `LICENSE` for details.
