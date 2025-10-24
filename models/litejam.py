@@ -42,6 +42,8 @@ class DSAConfig:
     n_heads: int
     top_k: int
     dropout: float = 0.1
+    threshold: Optional[float] = None
+    min_k: int = 1
 
 
 class DynamicSparseAttention(nn.Module):
@@ -53,6 +55,8 @@ class DynamicSparseAttention(nn.Module):
         self.n_heads = config.n_heads
         self.top_k = config.top_k
         self.dropout = nn.Dropout(config.dropout)
+        self.threshold = config.threshold
+        self.min_k = max(1, int(config.min_k))
 
         self.q_proj = nn.Linear(self.d_model, self.d_model)
         self.k_proj = nn.Linear(self.d_model, self.d_model)
@@ -71,10 +75,21 @@ class DynamicSparseAttention(nn.Module):
             raise ValueError(f"Expected embedding dim {self.d_model}, got {dim}")
 
         top_k = length if self.top_k <= 0 or self.top_k > length else self.top_k
+        top_k = max(top_k, self.min_k)
 
         importance_scores = self.importance(tokens)  # (B, L, H)
         scores = importance_scores.permute(0, 2, 1)  # (B, H, L)
-        _, topk_indices = torch.topk(scores, top_k, dim=-1)  # (B, H, K)
+        topk_scores, topk_indices = torch.topk(scores, top_k, dim=-1)  # (B, H, K)
+
+        keep_mask: Tensor | None
+        if self.threshold is not None:
+            keep_mask = topk_scores > self.threshold
+            if keep_mask.size(-1) > 0:
+                min_keep = min(self.min_k, keep_mask.size(-1))
+                if min_keep > 0:
+                    keep_mask[..., :min_keep] = True
+        else:
+            keep_mask = None
 
         q = self.q_proj(tokens)
         k = self.k_proj(tokens)
@@ -93,6 +108,8 @@ class DynamicSparseAttention(nn.Module):
         v_selected = torch.gather(v, dim=2, index=gather_idx)  # (B, H, K, D)
 
         attn_logits = torch.matmul(q, k_selected.transpose(-2, -1)) / (head_dim**0.5)  # (B, H, L, K)
+        if keep_mask is not None:
+            attn_logits = attn_logits.masked_fill(~keep_mask.unsqueeze(2), float("-inf"))
         attn = torch.softmax(attn_logits, dim=-1)
         attn = self.dropout(attn)
 
@@ -111,10 +128,21 @@ class TransformerBlock(nn.Module):
         ffn_dim: int,
         dropout: float,
         top_k: int,
+        threshold: Optional[float] = None,
+        min_k: int = 1,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = DynamicSparseAttention(DSAConfig(d_model, n_heads, top_k, dropout))
+        self.attn = DynamicSparseAttention(
+            DSAConfig(
+                d_model=d_model,
+                n_heads=n_heads,
+                top_k=top_k,
+                dropout=dropout,
+                threshold=threshold,
+                min_k=min_k,
+            )
+        )
         self.norm2 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(
             nn.Linear(d_model, ffn_dim),
@@ -204,14 +232,25 @@ class HierarchicalHeads(nn.Module):
         features: Dict[str, Tensor],
         det_mask: Tensor | None = None,
         use_pred_mask: bool = False,
+        mask_mode: str = "hard",
+        mask_threshold: float = 0.5,
+        tau: float = 1.0,
     ) -> Dict[str, Tensor]:
+        if mask_mode not in {"soft", "hard"}:
+            raise ValueError(f"Unsupported mask_mode '{mask_mode}'. Expected 'soft' or 'hard'.")
+        tau = max(float(tau), 1e-6)
+
         refined: Dict[str, Tensor] = {}
         for name in self._task_names:
             branch = self.projectors[self._proj_alias[name]]
             refined[name] = features[name] + branch(features[name])
 
         logits_det = self.det_head(refined["det"])
+        if logits_det.size(1) < 2:
+            raise ValueError("Detection head must have at least two logits for mask computation.")
         prob_det = torch.softmax(logits_det, dim=1)[:, 1]
+        margin = logits_det[:, 1] - logits_det[:, 0]
+        soft_mask_pred = torch.sigmoid(margin / tau)
 
         type_logits = self.type_head(refined["type"])
         snr_logits = self.snr_head(refined["snr"]).squeeze(-1)
@@ -227,11 +266,11 @@ class HierarchicalHeads(nn.Module):
         }
 
         if det_mask is not None:
-            outputs["mask"] = det_mask.bool()
+            outputs["mask"] = det_mask.float() if mask_mode == "soft" else det_mask.bool()
         elif use_pred_mask:
-            outputs["mask"] = (prob_det > 0.5)
+            outputs["mask"] = soft_mask_pred if mask_mode == "soft" else (prob_det > mask_threshold)
         else:
-            outputs["mask"] = prob_det > 0.5
+            outputs["mask"] = soft_mask_pred if mask_mode == "soft" else (prob_det > mask_threshold)
 
         return outputs
 
@@ -268,9 +307,20 @@ class SimpleHeads(nn.Module):
         features: Dict[str, Tensor],
         det_mask: Tensor | None = None,
         use_pred_mask: bool = False,
+        mask_mode: str = "hard",
+        mask_threshold: float = 0.5,
+        tau: float = 1.0,
     ) -> Dict[str, Tensor]:
+        if mask_mode not in {"soft", "hard"}:
+            raise ValueError(f"Unsupported mask_mode '{mask_mode}'. Expected 'soft' or 'hard'.")
+        tau = max(float(tau), 1e-6)
+
         logits_det = self.det_head(features["det"])
+        if logits_det.size(1) < 2:
+            raise ValueError("Detection head must have at least two logits for mask computation.")
         prob_det = torch.softmax(logits_det, dim=1)[:, 1]
+        margin = logits_det[:, 1] - logits_det[:, 0]
+        soft_mask_pred = torch.sigmoid(margin / tau)
 
         outputs: Dict[str, Tensor] = {
             "det": logits_det,
@@ -281,9 +331,12 @@ class SimpleHeads(nn.Module):
         }
 
         if det_mask is not None:
-            outputs["mask"] = det_mask.bool()
+            outputs["mask"] = det_mask.float() if mask_mode == "soft" else det_mask.bool()
         else:
-            outputs["mask"] = prob_det > 0.5 if use_pred_mask else prob_det > 0.5
+            if use_pred_mask:
+                outputs["mask"] = soft_mask_pred if mask_mode == "soft" else (prob_det > mask_threshold)
+            else:
+                outputs["mask"] = soft_mask_pred if mask_mode == "soft" else (prob_det > mask_threshold)
 
         return outputs
 
@@ -486,6 +539,8 @@ class LiteJamConfig:
     ffn_dim: int = 192
     dropout: float = 0.1
     top_k: int = 32
+    dsa_threshold: Optional[float] = None
+    dsa_min_k: int = 1
     num_transformer_layers: int = 2
     head_config: HeadsConfig = None
     dropout_head: float = 0.3
@@ -535,6 +590,8 @@ class LiteJamModel(nn.Module):
                     ffn_dim=config.ffn_dim,
                     dropout=config.dropout,
                     top_k=config.top_k,
+                    threshold=config.dsa_threshold,
+                    min_k=config.dsa_min_k,
                 )
             else:
                 block = TransformerBlockDense(
@@ -564,6 +621,9 @@ class LiteJamModel(nn.Module):
         inputs: Tensor,
         det_labels: Optional[Tensor] = None,
         use_pred_mask: bool = False,
+        mask_mode: str = "hard",
+        mask_threshold: float = 0.5,
+        tau: float = 1.0,
     ) -> Dict[str, Tensor]:
         inputs = self.preprocessor(inputs)
         features = self.encoder(inputs)
@@ -591,7 +651,14 @@ class LiteJamModel(nn.Module):
             task_features[name] = self.dropout(pooled)
 
         det_mask = det_labels if det_labels is not None else None
-        return self.heads(task_features, det_mask, use_pred_mask=use_pred_mask)
+        return self.heads(
+            task_features,
+            det_mask,
+            use_pred_mask=use_pred_mask,
+            mask_mode=mask_mode,
+            mask_threshold=mask_threshold,
+            tau=tau,
+        )
 
     def freeze_heads(self, active: Dict[str, bool]) -> None:
         self.heads.freeze_heads(active)
