@@ -87,7 +87,7 @@ python scripts/train_litejam.py \
   --groups jammer signal_to_noise bandwidth \
   --batch-size 128 \
   --num-workers 16 \
-  --device cuda \
+  --device auto \
   --epochs 200 \
   --lr 2e-3 \
   --mask-warmup 10
@@ -109,7 +109,7 @@ python scripts/eval_litejam.py \
   --groups jammer signal_to_noise bandwidth \
   --batch-size 128 \
   --num-workers 16 \
-  --device cuda \
+  --device auto \
   --output-dir eval_results
 ```
 
@@ -189,7 +189,7 @@ python -m baseline.resnet18.train \
   --groups jammer signal_to_noise bandwidth \
   --batch-size 128 \
   --num-workers 16 \
-  --device cuda \
+  --device auto \
   --epochs 200 \
   --lr 2e-3 \
   --mask-warmup 10 \
@@ -202,7 +202,7 @@ python -m baseline.resnet18.eval \
   --groups jammer signal_to_noise bandwidth \
   --batch-size 128 \
   --num-workers 16 \
-  --device cuda
+  --device auto
 ```
 
 Swap `resnet18` for `mobilenetv3`, `shufflenetv2`, `ghostnet`, `efficientformer`,
